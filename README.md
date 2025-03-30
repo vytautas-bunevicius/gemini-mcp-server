@@ -97,6 +97,70 @@ Information about available Gemini models, including capabilities and context wi
    npm start
    ```
 
+## Docker Setup
+
+You can also run the Gemini MCP Server using Docker:
+
+### Build the Docker Image
+
+```bash
+docker build -t gemini-mcp-server .
+```
+
+### Run the Container
+
+```bash
+docker run -it --rm \
+  -e GEMINI_API_KEY=your_api_key_here \
+  gemini-mcp-server
+```
+
+### Using with Claude for Desktop
+
+To use the Docker container with Claude for Desktop, you'll need to:
+
+1. Run the container with exposed ports:
+   ```bash
+   docker run -it --rm \
+   -e GEMINI_API_KEY=your_api_key_here \
+   -p 3001:3001 \
+   --name gemini-mcp \
+   gemini-mcp-server
+   ```
+
+2. In your Claude Desktop config file, reference the exposed port:
+   ```json
+   {
+     "mcpServers": {
+       "gemini": {
+         "url": "http://localhost:3001"
+       }
+     }
+   }
+   ```
+
+### Docker Compose
+
+You can also use Docker Compose for easier management:
+
+1. Create a `docker-compose.yml` file:
+   ```yaml
+   version: '3'
+   services:
+     gemini-mcp:
+       build: .
+       container_name: gemini-mcp
+       environment:
+         - GEMINI_API_KEY=your_api_key_here
+       ports:
+         - "3001:3001"
+   ```
+
+2. Run with:
+   ```bash
+   docker-compose up
+   ```
+
 ## Configuring Claude for Desktop
 
 1. Install [Claude for Desktop](https://claude.ai/desktop)

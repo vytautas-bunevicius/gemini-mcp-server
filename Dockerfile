@@ -1,19 +1,25 @@
 FROM node:18-alpine
 
-# Create app directory
+# Set working directory
 WORKDIR /usr/src/app
 
-# Install app dependencies
-# A wildcard is used to ensure both package.json AND package-lock.json are copied
+# Copy package files for dependency installation
 COPY package*.json ./
 
+# Install production dependencies only
 RUN npm ci --only=production
 
-# Bundle app source
+# Copy source code and tsconfig
 COPY . .
 
-# Expose the port the app runs on
+# Build the TypeScript project
+RUN npm run build && chmod 755 build/index.js
+
+# Expose port for HTTP transport (if needed in future)
 EXPOSE 3001
 
-# Start the application
-CMD ["npm", "start"]
+# Set environment variables
+ENV NODE_ENV=production
+
+# Run the server
+CMD ["node", "build/index.js"]
