@@ -9,11 +9,9 @@
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { HttpServerTransport } from "@modelcontextprotocol/sdk/server/http.js";
 import { z } from "zod";
 import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 import dotenv from "dotenv";
-import express from "express";
 
 // Load environment variables
 dotenv.config();
@@ -24,12 +22,6 @@ if (!apiKey) {
   console.error("Error: GEMINI_API_KEY environment variable is required");
   process.exit(1);
 }
-
-// MCP server configuration
-const MCP_PORT = parseInt(process.env.MCP_PORT || "3002", 10);
-const MCP_HOST = process.env.MCP_HOST || "127.0.0.1";
-const MCP_AUTH_ENABLED = process.env.MCP_AUTH_ENABLED === "true";
-const MCP_AUTH_SECRET = process.env.MCP_AUTH_SECRET;
 
 // Initialize the Gemini API
 const genAI = new GoogleGenerativeAI(apiKey);
@@ -395,7 +387,7 @@ server.tool(
  */
 server.resource(
   "gemini_models",
-  "Information about available Gemini models",
+  "gemini_models_resource",
   async () => {
     const models = [
       {
@@ -404,13 +396,6 @@ server.resource(
         description: "Advanced multimodal model with strong reasoning capabilities",
         features: ["Text", "Images", "Function calling"],
         contextWindow: 1000000,
-      },
-      {
-        id: "gemini-2.5-flash",
-        name: "Gemini 2.5 Flash",
-        description: "Fast and efficient model for general-purpose tasks",
-        features: ["Text", "Images"],
-        contextWindow: 128000,
       },
       {
         id: "gemini-2.0-flash",
@@ -429,9 +414,9 @@ server.resource(
     ];
 
     return {
-      content: [
+      contents: [
         {
-          type: "text",
+          uri: "models.json",
           text: JSON.stringify(models, null, 2),
         },
       ],
@@ -441,7 +426,7 @@ server.resource(
 
 /**
  * Start the MCP server
- * Support both stdio (for local connections) and HTTP+SSE (for remote connections) transport
+ * Support stdio transport for local connections
  */
 async function main() {
   try {
@@ -449,48 +434,6 @@ async function main() {
     const stdioTransport = new StdioServerTransport();
     await server.connect(stdioTransport);
     console.error("Gemini MCP Server running on stdio");
-
-    // Also start HTTP+SSE transport for remote connections if requested
-    if (process.argv.includes("--http") || process.env.MCP_HTTP_ENABLED === "true") {
-      // Create Express app for HTTP transport
-      const app = express();
-
-      // Simple authentication middleware for remote connections
-      if (MCP_AUTH_ENABLED) {
-        if (!MCP_AUTH_SECRET) {
-          console.error("Warning: MCP_AUTH_ENABLED is true but MCP_AUTH_SECRET is not set.");
-          console.error("Authentication will be disabled.");
-        } else {
-          app.use((req, res, next) => {
-            const authHeader = req.headers.authorization;
-            if (!authHeader || authHeader !== `Bearer ${MCP_AUTH_SECRET}`) {
-              res.status(401).json({ error: "Unauthorized" });
-              return;
-            }
-            next();
-          });
-        }
-      }
-
-      // Create HTTP transport
-      const httpTransport = new HttpServerTransport({
-        app,
-        path: "/mcp",
-      });
-
-      // Health check endpoint
-      app.get("/health", (req, res) => {
-        res.json({ status: "ok", version: "1.0.0" });
-      });
-
-      // Connect HTTP transport
-      await server.connect(httpTransport);
-
-      // Start HTTP server
-      app.listen(MCP_PORT, MCP_HOST, () => {
-        console.error(`Gemini MCP Server HTTP+SSE transport running on http://${MCP_HOST}:${MCP_PORT}/mcp`);
-      });
-    }
   } catch (error: any) {
     console.error("Error starting server:", error.message || error);
     process.exit(1);
