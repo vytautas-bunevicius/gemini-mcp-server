@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 
 /**
- * Gemini MCP Server implementation
- * This server provides tools to interact with Google's Gemini AI models
- * following the Model Context Protocol
+ * Gemini MCP Server
+ * A Model Context Protocol server for interacting with Google's Gemini AI models
+ * 
+ * This server implements the MCP specification to provide a standardized interface
+ * for LLM clients like Claude to interact with Gemini models.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { HttpServerTransport } from "@modelcontextprotocol/sdk/server/http.js";
 import { z } from "zod";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 import dotenv from "dotenv";
+import express from "express";
 
 // Load environment variables
 dotenv.config();
@@ -21,10 +25,35 @@ if (!apiKey) {
   process.exit(1);
 }
 
+// MCP server configuration
+const MCP_PORT = parseInt(process.env.MCP_PORT || "3002", 10);
+const MCP_HOST = process.env.MCP_HOST || "127.0.0.1";
+const MCP_AUTH_ENABLED = process.env.MCP_AUTH_ENABLED === "true";
+const MCP_AUTH_SECRET = process.env.MCP_AUTH_SECRET;
+
 // Initialize the Gemini API
 const genAI = new GoogleGenerativeAI(apiKey);
 
-// Create server instance
+/**
+ * Define the available Gemini models
+ */
+const GeminiModels = z.enum([
+  // Gemini 2.0 models
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-lite",
+  "gemini-2.0-flash-thinking-exp-01-21",
+  "gemini-2.0-flash-exp-image-generation",
+  // Gemini 2.5 models
+  "gemini-2.5-pro-exp-03-25",
+  "gemini-2.5-flash",
+  // Include older models for backward compatibility
+  "gemini-pro",
+  "gemini-ultra"
+]);
+
+/**
+ * Create the MCP server instance
+ */
 const server = new McpServer({
   name: "gemini",
   version: "1.0.0",
@@ -36,79 +65,202 @@ const server = new McpServer({
 });
 
 /**
- * Helper functions for interacting with Gemini API
+ * Helper class for interacting with Gemini API
+ * This provides a clean abstraction over the Gemini API
  */
+class GeminiAPI {
+  private models: Map<string, GenerativeModel> = new Map();
 
-/**
- * Generate content from a Gemini model
- */
-async function generateGeminiContent(
-  modelName: string,
-  prompt: string,
-  options: any = {}
-): Promise<string> {
-  try {
-    const model = genAI.getGenerativeModel({ model: modelName });
-    const result = await model.generateContent(prompt);
-    return result.response.text();
-  } catch (error: any) {
-    console.error("Error generating content:", error);
-    throw new Error(`Failed to get response from Gemini: ${error.message || error}`);
+  /**
+   * Get or create a GenerativeModel instance
+   */
+  private getModel(modelName: string): GenerativeModel {
+    if (!this.models.has(modelName)) {
+      this.models.set(modelName, genAI.getGenerativeModel({ model: modelName }));
+    }
+    return this.models.get(modelName)!;
+  }
+
+  /**
+   * Generate content from a Gemini model
+   */
+  async generateContent(
+    modelName: string,
+    prompt: string,
+    options: any = {}
+  ): Promise<string> {
+    try {
+      // Implement exponential backoff for API requests
+      let retries = 0;
+      const maxRetries = 3;
+      const baseDelay = 1000; // 1 second
+
+      while (retries < maxRetries) {
+        try {
+          const model = this.getModel(modelName);
+          const safetySettings = options.safetySettings || undefined;
+          const generationConfig = {
+            temperature: options.temperature,
+            maxOutputTokens: options.maxOutputTokens,
+            topK: options.topK,
+            topP: options.topP,
+          };
+
+          const result = await model.generateContent({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig,
+            safetySettings,
+          });
+
+          return result.response.text();
+        } catch (error: any) {
+          // Only retry on 429 (rate limit) or 5xx (server error) status codes
+          if (error.status === 429 || (error.status >= 500 && error.status < 600)) {
+            retries++;
+            if (retries < maxRetries) {
+              // Exponential backoff with jitter
+              const delay = baseDelay * Math.pow(2, retries) * (0.5 + Math.random() * 0.5);
+              console.error(`Retrying after ${delay}ms (attempt ${retries}/${maxRetries})...`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+              continue;
+            }
+          }
+          throw error;
+        }
+      }
+      throw new Error("Maximum retries exceeded");
+    } catch (error: any) {
+      console.error("Error generating content:", error);
+      throw new Error(`Failed to get response from Gemini: ${error.message || JSON.stringify(error)}`);
+    }
+  }
+
+  /**
+   * Create and use a chat session
+   */
+  async chatWithHistory(
+    modelName: string,
+    history: any[],
+    message: string,
+    options: any = {}
+  ): Promise<string> {
+    try {
+      const model = this.getModel(modelName);
+
+      // Convert history to Gemini API format
+      const formattedHistory = history.map(msg => ({
+        role: msg.role === "user" ? "user" : "model",
+        parts: [{ text: msg.content }]
+      }));
+
+      // Add the new message
+      const contents = [
+        ...formattedHistory,
+        { role: "user", parts: [{ text: message }] }
+      ];
+
+      // Generation config
+      const generationConfig = {
+        temperature: options.temperature,
+        maxOutputTokens: options.maxOutputTokens,
+        topK: options.topK,
+        topP: options.topP,
+      };
+
+      const result = await model.generateContent({
+        contents,
+        generationConfig,
+      });
+
+      return result.response.text();
+    } catch (error: any) {
+      console.error("Error in chat session:", error);
+      throw new Error(`Failed to chat with Gemini: ${error.message || JSON.stringify(error)}`);
+    }
+  }
+
+  /**
+   * Call a function using Gemini's function calling capability
+   */
+  async callFunction(
+    modelName: string,
+    prompt: string,
+    functionDefs: any[],
+    options: any = {}
+  ): Promise<any> {
+    try {
+      const model = this.getModel(modelName);
+
+      // Check if model supports function calling
+      // Note: This is only available in newer Gemini models
+      if (!model.startChat) {
+        throw new Error(`Model ${modelName} doesn't support function calling`);
+      }
+
+      const chat = model.startChat({
+        generationConfig: {
+          temperature: options.temperature,
+          maxOutputTokens: options.maxOutputTokens,
+        },
+        tools: [{ functionDeclarations: functionDefs }],
+      });
+
+      const result = await chat.sendMessage(prompt);
+
+      if (result.response.functionCall) {
+        return {
+          functionName: result.response.functionCall.name,
+          functionArgs: JSON.parse(result.response.functionCall.args),
+        };
+      }
+
+      return { text: result.response.text() };
+    } catch (error: any) {
+      console.error("Error calling function:", error);
+      throw new Error(`Failed to call function with Gemini: ${error.message || JSON.stringify(error)}`);
+    }
   }
 }
 
-/**
- * Generate content with a chat history
- */
-async function chatWithGemini(
-  modelName: string,
-  history: any[],
-  message: string,
-  options: any = {}
-): Promise<string> {
-  try {
-    const model = genAI.getGenerativeModel({ model: modelName });
-    const chat = model.startChat({ history });
-    const result = await chat.sendMessage(message);
-    return result.response.text();
-  } catch (error: any) {
-    console.error("Error in chat session:", error);
-    throw new Error(`Failed to chat with Gemini: ${error.message || error}`);
-  }
-}
+// Create an instance of the GeminiAPI helper
+const geminiAPI = new GeminiAPI();
 
-// Register the ask_gemini tool
+/**
+ * Register the ask_gemini tool
+ */
 server.tool(
   "ask_gemini",
   "Ask a question to Google's Gemini AI model and get a response",
   {
-    model: z.enum([
-      // Gemini 2.0 models
-      "gemini-2.0-flash",
-      "gemini-2.0-flash-lite",
-      "gemini-2.0-flash-thinking-exp-01-21",
-      "gemini-2.0-flash-exp-image-generation",
-      // Gemini 2.5 models
-      "gemini-2.5-pro-exp-03-25",
-    ]).describe("The Gemini model to use"),
+    model: GeminiModels.describe("The Gemini model to use"),
     query: z.string().describe("The question or prompt to send to Gemini"),
     temperature: z.number().optional().describe("Controls randomness (0-1)"),
     maxOutputTokens: z.number().optional().describe("Maximum tokens to generate"),
+    topK: z.number().optional().describe("Optional. The number of most likely tokens to consider for generation."),
+    topP: z.number().optional().describe("Optional. The cumulative probability of tokens to consider for generation."),
   },
-  async ({ model, query, temperature, maxOutputTokens }) => {
+  async ({ model, query, temperature, maxOutputTokens, topK, topP }) => {
     const options: any = {};
-    
+
     if (temperature !== undefined) {
       options.temperature = temperature;
     }
-    
+
     if (maxOutputTokens !== undefined) {
       options.maxOutputTokens = maxOutputTokens;
     }
-    
+
+    if (topK !== undefined) {
+      options.topK = topK;
+    }
+
+    if (topP !== undefined) {
+      options.topP = topP;
+    }
+
     try {
-      const response = await generateGeminiContent(model, query, options);
-      
+      const response = await geminiAPI.generateContent(model, query, options);
+
       return {
         content: [
           {
@@ -118,6 +270,7 @@ server.tool(
         ],
       };
     } catch (error: any) {
+      console.error("Error in ask_gemini tool:", error);
       return {
         content: [
           {
@@ -130,39 +283,41 @@ server.tool(
   }
 );
 
-// Define the conversation message schema
+/**
+ * Define the conversation message schema
+ */
 const conversationMessageSchema = z.object({
   role: z.enum(["user", "model"]),
   content: z.string(),
 });
 
-// Register the chat_with_gemini tool
+/**
+ * Register the chat_with_gemini tool
+ */
 server.tool(
   "chat_with_gemini",
   "Have a multi-turn conversation with Google's Gemini AI",
   {
-    model: z.enum([
-      // Gemini 2.0 models
-      "gemini-2.0-flash",
-      "gemini-2.0-flash-lite",
-      "gemini-2.0-flash-thinking-exp-01-21",
-      // Gemini 2.5 models
-      "gemini-2.5-pro-exp-03-25",
-    ]).describe("The Gemini model to use"),
+    model: GeminiModels.describe("The Gemini model to use"),
     conversation: z.array(conversationMessageSchema).describe("Previous conversation history"),
     message: z.string().describe("New message to add to the conversation"),
     temperature: z.number().optional().describe("Controls randomness (0-1)"),
+    maxOutputTokens: z.number().optional().describe("Maximum tokens to generate"),
   },
-  async ({ model, conversation, message, temperature }) => {
+  async ({ model, conversation, message, temperature, maxOutputTokens }) => {
     const options: any = {};
-    
+
     if (temperature !== undefined) {
       options.temperature = temperature;
     }
-    
+
+    if (maxOutputTokens !== undefined) {
+      options.maxOutputTokens = maxOutputTokens;
+    }
+
     try {
-      const response = await chatWithGemini(model, conversation, message, options);
-      
+      const response = await geminiAPI.chatWithHistory(model, conversation, message, options);
+
       return {
         content: [
           {
@@ -172,6 +327,7 @@ server.tool(
         ],
       };
     } catch (error: any) {
+      console.error("Error in chat_with_gemini tool:", error);
       return {
         content: [
           {
@@ -185,20 +341,164 @@ server.tool(
 );
 
 /**
- * Main function to start the server
+ * Register the gemini_function_call tool
+ * This is for newer Gemini models that support function calling
+ */
+server.tool(
+  "gemini_function_call",
+  "Call a function using Gemini's function calling capability",
+  {
+    model: GeminiModels.describe("The Gemini model to use"),
+    prompt: z.string().describe("The prompt to send to Gemini"),
+    functions: z.array(z.any()).describe("Function definitions"),
+    temperature: z.number().optional().describe("Controls randomness (0-1)"),
+    maxOutputTokens: z.number().optional().describe("Maximum tokens to generate"),
+  },
+  async ({ model, prompt, functions, temperature, maxOutputTokens }) => {
+    const options: any = {};
+
+    if (temperature !== undefined) {
+      options.temperature = temperature;
+    }
+
+    if (maxOutputTokens !== undefined) {
+      options.maxOutputTokens = maxOutputTokens;
+    }
+
+    try {
+      const response = await geminiAPI.callFunction(model, prompt, functions, options);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(response),
+          },
+        ],
+      };
+    } catch (error: any) {
+      console.error("Error in gemini_function_call tool:", error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: ${error.message || "Unknown error"}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+/**
+ * Define a resource for Gemini model information
+ */
+server.resource(
+  "gemini_models",
+  "Information about available Gemini models",
+  async () => {
+    const models = [
+      {
+        id: "gemini-2.5-pro-exp-03-25",
+        name: "Gemini 2.5 Pro",
+        description: "Advanced multimodal model with strong reasoning capabilities",
+        features: ["Text", "Images", "Function calling"],
+        contextWindow: 1000000,
+      },
+      {
+        id: "gemini-2.5-flash",
+        name: "Gemini 2.5 Flash",
+        description: "Fast and efficient model for general-purpose tasks",
+        features: ["Text", "Images"],
+        contextWindow: 128000,
+      },
+      {
+        id: "gemini-2.0-flash",
+        name: "Gemini 2.0 Flash",
+        description: "Efficient general-purpose model",
+        features: ["Text"],
+        contextWindow: 32000,
+      },
+      {
+        id: "gemini-2.0-flash-lite",
+        name: "Gemini 2.0 Flash Lite",
+        description: "Lightweight version of Gemini 2.0 Flash",
+        features: ["Text"],
+        contextWindow: 16000,
+      },
+    ];
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(models, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+/**
+ * Start the MCP server
+ * Support both stdio (for local connections) and HTTP+SSE (for remote connections) transport
  */
 async function main() {
   try {
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
+    // Start with stdio transport for local connections
+    const stdioTransport = new StdioServerTransport();
+    await server.connect(stdioTransport);
     console.error("Gemini MCP Server running on stdio");
+
+    // Also start HTTP+SSE transport for remote connections if requested
+    if (process.argv.includes("--http") || process.env.MCP_HTTP_ENABLED === "true") {
+      // Create Express app for HTTP transport
+      const app = express();
+
+      // Simple authentication middleware for remote connections
+      if (MCP_AUTH_ENABLED) {
+        if (!MCP_AUTH_SECRET) {
+          console.error("Warning: MCP_AUTH_ENABLED is true but MCP_AUTH_SECRET is not set.");
+          console.error("Authentication will be disabled.");
+        } else {
+          app.use((req, res, next) => {
+            const authHeader = req.headers.authorization;
+            if (!authHeader || authHeader !== `Bearer ${MCP_AUTH_SECRET}`) {
+              res.status(401).json({ error: "Unauthorized" });
+              return;
+            }
+            next();
+          });
+        }
+      }
+
+      // Create HTTP transport
+      const httpTransport = new HttpServerTransport({
+        app,
+        path: "/mcp",
+      });
+
+      // Health check endpoint
+      app.get("/health", (req, res) => {
+        res.json({ status: "ok", version: "1.0.0" });
+      });
+
+      // Connect HTTP transport
+      await server.connect(httpTransport);
+
+      // Start HTTP server
+      app.listen(MCP_PORT, MCP_HOST, () => {
+        console.error(`Gemini MCP Server HTTP+SSE transport running on http://${MCP_HOST}:${MCP_PORT}/mcp`);
+      });
+    }
   } catch (error: any) {
     console.error("Error starting server:", error.message || error);
     process.exit(1);
   }
 }
 
+// Start the server
 main().catch((error: any) => {
   console.error("Fatal error in main():", error.message || error);
   process.exit(1);
-}); 
+});
