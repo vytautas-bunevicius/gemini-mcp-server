@@ -37,10 +37,6 @@ const GeminiModels = z.enum([
   "gemini-2.0-flash-exp-image-generation",
   // Gemini 2.5 models
   "gemini-2.5-pro-exp-03-25",
-  "gemini-2.5-flash",
-  // Include older models for backward compatibility
-  "gemini-pro",
-  "gemini-ultra"
 ]);
 
 /**
@@ -198,11 +194,14 @@ class GeminiAPI {
       });
 
       const result = await chat.sendMessage(prompt);
+      const functionCall = result.response.functionCall();
 
-      if (result.response.functionCall) {
+      if (functionCall) {
         return {
-          functionName: result.response.functionCall.name,
-          functionArgs: JSON.parse(result.response.functionCall.args),
+          functionName: functionCall.name,
+          functionArgs: typeof functionCall.args === 'string'
+            ? JSON.parse(functionCall.args)
+            : functionCall.args,
         };
       }
 
